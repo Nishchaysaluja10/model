@@ -54,10 +54,9 @@ def load_amr_model() -> GAT_Light:
 
     # A custom class that mimics the `pickle` module
     class CustomPickleModule:
-        __name__ = "custom_pickle"  # Mock the __name__ attribute for torch.load
-
-        def load(self, f):
-            return CustomUnpickler(f).load()
+        # torch.load expects the module to have an 'Unpickler' attribute
+        Unpickler = CustomUnpickler
+        __name__ = "custom_pickle"
 
     # Instantiate our custom pickle loader
     custom_pickle_loader = CustomPickleModule()
