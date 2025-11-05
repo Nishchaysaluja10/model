@@ -57,18 +57,17 @@ def load_amr_model() -> GAT_Light:
         Unpickler = CustomUnpickler
 
         @staticmethod
-        def load(f):
-            # The load function that torch.load will call
+        def load(f, **kwargs):  # Accept and ignore extra arguments
             return CustomPickleModule.Unpickler(f).load()
 
     # Load the state dictionary using the custom pickle module class
     state_dict = torch.load(
         MODEL_PATH,
         map_location=torch.device('cpu'),
-        pickle_module=CustomPickleModule  # Pass the class, not an instance
+        pickle_module=CustomPickleModule
     )
 
-    # Clean up the state dictionary keys (e.g., remove 'module.' prefix)
+    # Clean up the state dictionary keys
     new_state_dict = {}
     for k, v in state_dict.items():
         name = k[7:] if k.startswith('module.') else k
