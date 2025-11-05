@@ -1,32 +1,79 @@
+# -*- coding: utf-8 -*-
+"""
+This is the main application file, based on the `inference.py` logic.
+It accepts a .fasta file upload, calculates k-mers, runs the GAT
+model, and returns predictions with a graph visualization.
+
+This version includes fixes for:
+1.  Absolute paths to resolve 'FileNotFoundError'.
+2.  GATConv explicit arguments.
+3.  torch.load 'weights_only=False' and 'strict=False'.
+4.  numpy .item() and .flatten() for 'TypeError'.
+5.  Removal of the 'scaler.pkl' dependency for testing.
+6.  CRITICAL: str(fasta_path) for BioPython 'TypeError'.
+
+***********************************************************************
+** WARNING - NO SCALER **
+The 'StandardScaler' (scaler.pkl) dependency is removed.
+THE PREDICTIONS FROM THIS FILE WILL BE SCIENTIFICALLY INCORRECT.
+***********************************************************************
+"""
+
+from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi.responses import JSONResponse
+import shutil
 import os
 import pandas as pd
 import numpy as np
 import torch
 import torch.nn as nn
+from Bio import SeqIO
 from torch_geometric.data import Data
 from torch_geometric.nn import GATConv
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-from typing import List, Dict, Any
+import matplotlib.pyplot as plt
+import networkx as nx
+from pathlib import Path
+import pickle
+from typing import List
+import itertools # Added for explicit import
 
-# --- CONFIGURATION AND FILE PATHS ---
-# Final file name determined by successful data loading
-FEATURE_FILE = "ncbi_features.csv" 
-LABEL_FILE = "amr_labels_realistic_distribution.csv"
+# --- Absolute Path Configuration ---
+# CRITICAL FIX: Use the script's own directory to build absolute paths
+# This makes the script runnable from any location.
+SCRIPT_DIR = Path(__file__).resolve().parent
 
-# CRITICAL FIX: Path points to the file *inside* the folder
-MODEL_PATH = "best_gat_realistic/data.pkl" 
+UPLOAD_DIR = SCRIPT_DIR / "uploads"
+RESULT_DIR = SCRIPT_DIR / "results"
+MODEL_PATH = SCRIPT_DIR / "best_gat_realistic" / "data.pkl"
 
-# --- MODEL CLASS ---
+# Create directories for uploads and results
+UPLOAD_DIR.mkdir(exist_ok=True)
+RESULT_DIR.mkdir(exist_ok=True)
+
+# --- Model & Data Configuration ---
+NUM_KMERS = 4096  # (4^6) - Assuming 6-mers
+NUM_ANTIBIOTICS = 30  # Based on amr_labels_realistic_distribution.csv
+
+# List of antibiotics (from amr_labels_realistic_distribution.csv)
+ANTIBIOTICS_LIST = [
+    'amikacin', 'gentamicin', 'streptomycin', 'tobramycin', 'kanamycin', 
+    'ampicillin', 'piperacillin', 'amoxicillin', 'cefazolin', 'cephalexin', 
+    'ceftriaxone', 'cefotaxime', 'cefuroxime', 'cefepime', 'imipenem', 
+    'meropenem', 'ertapenem', 'doripenem', 'carbapenem', 'ciprofloxacin', 
+    'levofloxacin', 'moxifloxacin', 'erythromycin', 'azithromycin', 
+    'tetracycline', 'tigecycline', 'vancomycin', 'chloramphenicol', 
+    'fosfomycin', 'colistin'
+]
+
+# --- Model Class (with GATConv Fixes) ---
 class GAT_Light(nn.Module):
-    """Graph Attention Network model for AMR prediction."""
     def __init__(self, num_abs):
         super().__init__()
-        # FIX: Explicitly name in_channels and out_channels (solves initial TypeError)
+        # FIX: Use explicit keyword arguments for GATConv
         self.gat1 = GATConv(in_channels=1, out_channels=16, heads=4, dropout=0.5)
         self.gat2 = GATConv(in_channels=16*4, out_channels=8, heads=2, dropout=0.5)
         
-        self.fc1 = nn.Linear(8*2, 32) 
+        self.fc1 = nn.Linear(8*2, 32)
         self.fc2 = nn.Linear(32, num_abs)
         self.relu = nn.ReLU()
         self.dropout = nn.Dropout(0.5)
@@ -34,176 +81,207 @@ class GAT_Light(nn.Module):
 
     def forward(self, data):
         x, edge_index = data.x, data.edge_index
-
         x = self.dropout(x)
         x = self.relu(self.gat1(x, edge_index))
         x = self.dropout(x)
         x = self.relu(self.gat2(x, edge_index))
-
-        # Global mean pool
-        x = torch.mean(x, dim=0, keepdim=True)
-
+        x = torch.mean(x, dim=0, keepdim=True)  # Global Mean Pool
         x = self.relu(self.fc1(x))
         x = self.dropout(x)
         x = self.fc2(x)
         return self.sigmoid(x)
 
-# --- DATA AND MODEL LOADING FUNCTIONS ---
-
-def load_data():
-    """Loads feature and label dataframes and cleans the index."""
-    print("Loading data...")
-    if not all(os.path.exists(f) for f in [FEATURE_FILE, LABEL_FILE]):
-        raise FileNotFoundError("One or more required data files (features or labels) are missing.")
+# --- Helper Functions ---
+def load_amr_model() -> GAT_Light:
+    """Loads the GAT model with all our fixes."""
+    if not MODEL_PATH.exists():
+        raise FileNotFoundError(f"Model file not found at path: {MODEL_PATH}")
     
-    if not os.path.exists(MODEL_PATH):
-        raise FileNotFoundError(f"Model file not found at expected path: {MODEL_PATH}. "
-                                 "Please ensure 'best_gat_realistic.pth' is a folder and 'data.pkl' is inside it.")
-
-    # Load feature data
-    features_df = pd.read_csv(FEATURE_FILE).set_index('genome_id')
+    print(f"Loading model from {MODEL_PATH}...")
+    model = GAT_Light(num_abs=NUM_ANTIBIOTICS)
     
-    # CRITICAL FIX: Clean the index (genome_id) to remove hidden whitespace (solves 404 error)
-    features_df.index = features_df.index.astype(str).str.strip() 
-    
-    # Load label data
-    labels_df = pd.read_csv(LABEL_FILE).set_index('genome_id')
-
-    antibiotics = list(labels_df.columns)
-    
-    print(f"Data loaded. Total genomes: {len(features_df)}")
-    print(f"Antibiotics detected: {len(antibiotics)}")
-    return features_df, antibiotics
-
-def load_model(num_abs: int) -> GAT_Light:
-    """Initializes and loads the trained model weights."""
-    print(f"Initializing model and loading weights from {MODEL_PATH}...")
-    model = GAT_Light(num_abs=num_abs)
-    
-    # CRITICAL FIX: Set weights_only=False to load complex saved model
+    # FIX: Set weights_only=False to load the pickled file
     state_dict = torch.load(MODEL_PATH, map_location=torch.device('cpu'), weights_only=False)
     
-    # Adapt the state dict keys
     new_state_dict = {}
     for k, v in state_dict.items():
         name = k[7:] if k.startswith('module.') else k
         new_state_dict[name] = v
         
-    # strict=False allows for minor differences in model structure
+    # FIX: Set strict=False to handle any minor mismatches
     model.load_state_dict(new_state_dict, strict=False)
     model.eval()
     print("Model loaded successfully.")
     return model
+    
+def get_kmer_counts(fasta_path: Path, k: int = 6) -> np.ndarray:
+    """Calculates k-mer counts for a given FASTA file."""
+    print(f"Calculating {k}-mer counts for {fasta_path}...")
+    kmer_dict = {}
+    
+    # Generate all possible k-mers (4^k)
+    bases = ['A', 'T', 'C', 'G']
+    all_kmers = [''.join(p) for p in itertools.product(bases, repeat=k)]
+    for kmer in all_kmers:
+        kmer_dict[kmer] = 0
 
-def create_graph_data(genome_id: str, features_df: pd.DataFrame) -> Data:
-    """Creates a PyG Data object for a single genome prediction."""
-    # Ensure the queried ID is cleaned before lookup
-    cleaned_genome_id = genome_id.strip()
+    # Count k-mers in the fasta file
+    try:
+        # CRITICAL FIX: Convert Path object to string for SeqIO.parse
+        for record in SeqIO.parse(str(fasta_path), "fasta"):
+            seq = str(record.seq).upper()
+            for i in range(len(seq) - k + 1):
+                kmer = seq[i:i+k]
+                if kmer in kmer_dict:
+                    kmer_dict[kmer] += 1
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Error parsing FASTA file: {e}")
 
-    if cleaned_genome_id not in features_df.index:
-        raise HTTPException(status_code=404, detail=f"Genome ID '{genome_id}' not found in feature data. "
-                                                     "Check if the ID is valid or if the data file is correct.")
+    # Ensure the order is correct
+    counts = np.array([kmer_dict[kmer] for kmer in all_kmers])
+    
+    if len(counts) != NUM_KMERS:
+        raise HTTPException(
+            status_code=500, 
+            detail=f"K-mer count ({len(counts)}) does not match model expectation ({NUM_KMERS}). Check k-mer size."
+        )
+    print("K-mer counts calculated.")
+    return counts
 
-    features = features_df.loc[cleaned_genome_id].values.astype(np.float32)
-    x = torch.tensor(features).unsqueeze(1) 
-
+def create_graph_data(unscaled_features: np.ndarray) -> Data:
+    """Creates a PyG Data object from feature counts."""
+    # We are now feeding UN-SCALED features directly to the model
+    x = torch.tensor(unscaled_features, dtype=torch.float32).unsqueeze(1)
     num_nodes = x.size(0)
-    
-    # Edge Index: Self-loops for all nodes
+    # Create self-loops for each k-mer node
     edge_index = torch.arange(num_nodes, dtype=torch.long).repeat(2, 1)
+    return Data(x=x, edge_index=edge_index)
 
-    data = Data(x=x, edge_index=edge_index)
-    return data
+# --- FastAPI Application ---
+app = FastAPI(title="AMR End-to-End Prediction Service (NO SCALER - TEST ONLY)")
 
-# --- FASTAPI SETUP ---
-app = FastAPI(title="AMR Prediction Service", version="1.0")
-
-# Global variables for data and model
+# Load model on startup
+model = None # Initialize model as None
 try:
-    features_df, antibiotics = load_data()
-    model = load_model(num_abs=len(antibiotics))
+    model = load_amr_model()
 except Exception as e:
-    print(f"Startup Failure: {e}")
-    features_df, antibiotics, model = None, None, None
-    
-# --- API SCHEMA ---
-class PredictionRequest(BaseModel):
-    """Input structure for the prediction endpoint."""
-    genome_id: str = "GCA_002853715.1_ASM285371v1" 
+    print(f"!!! STARTUP FAILURE !!!: {e}")
+    # model remains None, so /predict_fasta will fail gracefully
 
-class PredictionResult(BaseModel):
-    """Output structure for a single antibiotic prediction."""
-    antibiotic: str
-    confidence: float
-    prediction: str
-
-class PredictionResponse(BaseModel):
-    """Overall output structure for the API endpoint."""
-    genome_id: str
-    predictions: List[PredictionResult]
-    summary: Dict[str, Any]
-
-# --- API ENDPOINT ---
-@app.post("/predict", response_model=PredictionResponse)
-def predict_amr(request: PredictionRequest):
+@app.post("/predict_fasta")
+def predict_from_fasta(file: UploadFile = File(...)):
     """
-    Predicts Antimicrobial Resistance (AMR) for a given genome ID.
+    Upload a .fasta genome file, predict AMR, and get a result graph.
+    WARNING: Predictions are meaningless as the scaler is removed.
     """
-    if not model or features_df is None:
-        raise HTTPException(status_code=503, detail="Service not ready. Model or data failed to load during startup.")
+    if not model:
+        raise HTTPException(
+            status_code=503, 
+            detail="Service not ready. Model failed to load on startup. Check server logs for 'STARTUP FAILURE'."
+        )
 
-    genome_id = request.genome_id
+    # Save uploaded file
+    upload_path = UPLOAD_DIR / file.filename
+    try:
+        with open(upload_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+    finally:
+        file.file.close()
 
     try:
-        # 1. Create the PyG Data object (includes ID cleaning)
-        data = create_graph_data(genome_id, features_df)
+        # 1. Calculate k-mer counts
+        kmer_counts = get_kmer_counts(upload_path)
 
-        # 2. Run prediction
+        # 2. Prepare features (NO SCALER)
+        kmer_counts_reshaped = kmer_counts.reshape(1, -1)
+        features_for_graph = kmer_counts_reshaped.flatten()
+
+        # 3. Create graph data
+        data = create_graph_data(features_for_graph)
+
+        # 4. Run prediction
         with torch.no_grad():
-            output = model(data)
-            
-        # CRITICAL FIX: Flatten the output tensor before converting to numpy 
-        probabilities = output.flatten().numpy()
+            # FIX: Use flatten() to ensure 1D array
+            pred_probs = model(data).flatten().numpy()
 
-        # 3. Format results
-        results = []
+        # 5. Format results
         resistant_count = 0
         susceptible_count = 0
-        RESISTANCE_THRESHOLD = 0.5
-        
-        for ab, prob in zip(antibiotics, probabilities):
-            # CRITICAL FIX: Use item() to extract the scalar float from the NumPy array (solves TypeError)
-            # We use float(prob.item()) to ensure it's a standard Python float for Pydantic serialization
+        predictions = []
+        for ab, prob in zip(ANTIBIOTICS_LIST, pred_probs):
+            # FIX: Use item() to convert numpy float to Python float
             confidence = float(prob.item())
-            is_resistant = confidence > RESISTANCE_THRESHOLD
+            is_resistant = confidence > 0.5
             
-            results.append(PredictionResult(
-                antibiotic=ab,
-                confidence=confidence,
-                prediction="RESISTANT" if is_resistant else "SUSCEPTIBLE"
-            ))
+            pred_str = "RESISTANT" if is_resistant else "SUSCEPTIBLE"
+            predictions.append({
+                "antibiotic": ab,
+                "confidence": confidence,
+                "prediction": pred_str
+            })
             if is_resistant:
                 resistant_count += 1
             else:
                 susceptible_count += 1
-        
-        summary = {
-            "total_antibiotics": len(antibiotics),
-            "resistant": resistant_count,
-            "susceptible": susceptible_count,
-            "resistance_threshold": RESISTANCE_THRESHOLD
-        }
 
-        return PredictionResponse(genome_id=genome_id, predictions=results, summary=summary)
+        # --- 6. Create and save graph visualization ---
+        G = nx.Graph()
+        G.add_node("Genome", size=4000, color='#3366CC')
+        colors = []
+        for p in predictions:
+            G.add_node(p['antibiotic'], size=1000)
+            G.add_edge("Genome", p['antibiotic'])
+            colors.append('#FF3333' if p['prediction'] == 'RESISTANT' else '#33DD33')
+
+        fig, ax = plt.subplots(figsize=(18, 18))
+        pos = nx.spring_layout(G, k=0.8, iterations=50, seed=42)
+        
+        nx.draw_networkx_nodes(G, pos, nodelist=["Genome"], node_size=4000, node_color='#3366CC', ax=ax)
+        nx.draw_networkx_nodes(G, pos, nodelist=ANTIBIOTICS_LIST, node_size=1000, node_color=colors, ax=ax)
+        nx.draw_networkx_edges(G, pos, width=2.0, alpha=0.6, ax=ax)
+        
+        labels = {n: n for n in G.nodes()}
+        nx.draw_networkx_labels(G, pos, labels, font_size=9, font_weight='bold', font_color='white', ax=ax)
+
+        from matplotlib.patches import Patch
+        legend_elements = [
+            Patch(facecolor='#FF3333', edgecolor='black', label=f'Resistant - {resistant_count}'),
+            Patch(facecolor='#33DD33', edgecolor='black', label=f'Susceptible - {susceptible_count}')
+        ]
+        ax.legend(handles=legend_elements, loc='upper left', fontsize=14)
+        ax.set_title(f'AMR Prediction for {file.filename}', fontsize=16, weight='bold')
+        ax.axis('off')
+
+        plt.tight_layout()
+        # Use absolute path for saving
+        graph_path = RESULT_DIR / f"{Path(file.filename).stem}_graph.png"
+        plt.savefig(graph_path, dpi=200, bbox_inches='tight')
+        plt.close()
+
+        # Use absolute path for saving
+        csv_path = RESULT_DIR / f"{Path(file.filename).stem}_predictions.csv"
+        pd.DataFrame(predictions).to_csv(csv_path, index=False)
+
+        return JSONResponse(content={
+            "status": "success",
+            "filename": file.filename,
+            "summary": {
+                "resistant": resistant_count,
+                "susceptible": susceptible_count
+            },
+            "predictions": predictions,
+            # Return string representations of the paths
+            "result_csv_file": str(csv_path),
+            "result_graph_file": str(graph_path)
+        })
 
     except HTTPException as e:
-        raise e
+        raise e  # Re-raise HTTP exceptions
     except Exception as e:
-        # Catch and report any remaining execution errors (e.g., shape mismatches)
-        print(f"An unexpected error occurred during prediction: {e}")
-        raise HTTPException(status_code=500, detail=f"Prediction failed due to an internal server error: {str(e)}")
+        print(f"Error during prediction for {file.filename}: {e}")
+        raise HTTPException(status_code=500, detail=f"An internal error occurred: {str(e)}")
 
-# Add a simple root endpoint for health check
 @app.get("/")
 def read_root():
-    return {"status": "ok", "message": "AMR Prediction API is running."}
+    return {"message": "AMR Prediction API (Inference Mode) is running. "
+                     "WARNING: Scaler is disabled. Predictions are for test only."}
