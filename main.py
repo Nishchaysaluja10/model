@@ -109,7 +109,12 @@ def create_graph_data(unscaled_features: np.ndarray) -> Data:
 app = FastAPI(title="AMR End-to-End Prediction Service (NO SCALER - TEST ONLY)")
 
 # Load model on startup
-model = load_amr_model()
+model = None # Initialize model as None
+try:
+    model = load_amr_model()
+except Exception as e:
+    print(f"!!! STARTUP FAILURE !!!: {e}")
+    # model remains None, so /predict_fasta will fail gracefully
 
 @app.post("/predict_fasta")
 def predict_from_fasta(file: UploadFile = File(...)):
