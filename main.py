@@ -26,16 +26,14 @@ import os
 import pandas as pd
 import numpy as np
 import torch
-import torch.nn as nn
 from Bio import SeqIO
 from torch_geometric.data import Data
-from torch_geometric.nn import GATConv
 import matplotlib.pyplot as plt
 import networkx as nx
 from pathlib import Path
-import pickle
 from typing import List
 import itertools # Added for explicit import
+from inference import load_amr_model, GAT_Light
 
 # --- Absolute Path Configuration ---
 # CRITICAL FIX: Use the script's own directory to build absolute paths
@@ -44,7 +42,6 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 
 UPLOAD_DIR = SCRIPT_DIR / "uploads"
 RESULT_DIR = SCRIPT_DIR / "results"
-MODEL_PATH = SCRIPT_DIR / "best_gat_realistic" / "data.pkl"
 
 # Create directories for uploads and results
 UPLOAD_DIR.mkdir(exist_ok=True)
@@ -52,7 +49,6 @@ RESULT_DIR.mkdir(exist_ok=True)
 
 # --- Model & Data Configuration ---
 NUM_KMERS = 4096  # (4^6) - Assuming 6-mers
-NUM_ANTIBIOTICS = 30  # Based on amr_labels_realistic_distribution.csv
 
 # List of antibiotics (from amr_labels_realistic_distribution.csv)
 ANTIBIOTICS_LIST = [
@@ -65,55 +61,7 @@ ANTIBIOTICS_LIST = [
     'fosfomycin', 'colistin'
 ]
 
-# --- Model Class (with GATConv Fixes) ---
-class GAT_Light(nn.Module):
-    def __init__(self, num_abs):
-        super().__init__()
-        # FIX: Use explicit keyword arguments for GATConv
-        self.gat1 = GATConv(in_channels=1, out_channels=16, heads=4, dropout=0.5)
-        self.gat2 = GATConv(in_channels=16*4, out_channels=8, heads=2, dropout=0.5)
-        
-        self.fc1 = nn.Linear(8*2, 32)
-        self.fc2 = nn.Linear(32, num_abs)
-        self.relu = nn.ReLU()
-        self.dropout = nn.Dropout(0.5)
-        self.sigmoid = nn.Sigmoid()
-
-    def forward(self, data):
-        x, edge_index = data.x, data.edge_index
-        x = self.dropout(x)
-        x = self.relu(self.gat1(x, edge_index))
-        x = self.dropout(x)
-        x = self.relu(self.gat2(x, edge_index))
-        x = torch.mean(x, dim=0, keepdim=True)  # Global Mean Pool
-        x = self.relu(self.fc1(x))
-        x = self.dropout(x)
-        x = self.fc2(x)
-        return self.sigmoid(x)
-
 # --- Helper Functions ---
-def load_amr_model() -> GAT_Light:
-    """Loads the GAT model with all our fixes."""
-    if not MODEL_PATH.exists():
-        raise FileNotFoundError(f"Model file not found at path: {MODEL_PATH}")
-    
-    print(f"Loading model from {MODEL_PATH}...")
-    model = GAT_Light(num_abs=NUM_ANTIBIOTICS)
-    
-    # FIX: Set weights_only=False to load the pickled file
-    state_dict = torch.load(MODEL_PATH, map_location=torch.device('cpu'), weights_only=False)
-    
-    new_state_dict = {}
-    for k, v in state_dict.items():
-        name = k[7:] if k.startswith('module.') else k
-        new_state_dict[name] = v
-        
-    # FIX: Set strict=False to handle any minor mismatches
-    model.load_state_dict(new_state_dict, strict=False)
-    model.eval()
-    print("Model loaded successfully.")
-    return model
-    
 def get_kmer_counts(fasta_path: Path, k: int = 6) -> np.ndarray:
     """Calculates k-mer counts for a given FASTA file."""
     print(f"Calculating {k}-mer counts for {fasta_path}...")
@@ -161,12 +109,7 @@ def create_graph_data(unscaled_features: np.ndarray) -> Data:
 app = FastAPI(title="AMR End-to-End Prediction Service (NO SCALER - TEST ONLY)")
 
 # Load model on startup
-model = None # Initialize model as None
-try:
-    model = load_amr_model()
-except Exception as e:
-    print(f"!!! STARTUP FAILURE !!!: {e}")
-    # model remains None, so /predict_fasta will fail gracefully
+model = load_amr_model()
 
 @app.post("/predict_fasta")
 def predict_from_fasta(file: UploadFile = File(...)):
