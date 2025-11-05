@@ -39,29 +39,44 @@ class GAT_Light(nn.Module):
 
 # --- Helper Functions ---
 def load_amr_model() -> GAT_Light:
-    """Loads the GAT model with all our fixes."""
+    """Loads the GAT model with a custom unpickler to handle legacy files."""
     if not MODEL_PATH.exists():
         raise FileNotFoundError(f"Model file not found at path: {MODEL_PATH}")
 
+    print(f"Loading model from {MODEL_PATH}...")
     model = GAT_Light(num_abs=NUM_ANTIBIOTICS)
 
+    # Custom Unpickler to handle the 'persistent_load' instruction
     class CustomUnpickler(pickle.Unpickler):
         def persistent_load(self, saved_id):
-            return None # Ignore persistent IDs
+            # This is a placeholder. We don't need to load anything from persistent_id.
+            return None
 
-    # The pickle_module argument is used to override the pickle loader.
-    # We define a custom loader that uses our CustomUnpickler to handle the persistent_id.
-    custom_pickle = {
-        'load': lambda f: CustomUnpickler(f).load()
-    }
+    # A custom class that mimics the `pickle` module
+    class CustomPickleModule:
+        __name__ = "custom_pickle"  # Mock the __name__ attribute for torch.load
 
-    state_dict = torch.load(MODEL_PATH, map_location=torch.device('cpu'), pickle_module=custom_pickle)
+        def load(self, f):
+            return CustomUnpickler(f).load()
 
+    # Instantiate our custom pickle loader
+    custom_pickle_loader = CustomPickleModule()
+
+    # Load the state dictionary using the custom pickle module
+    state_dict = torch.load(
+        MODEL_PATH,
+        map_location=torch.device('cpu'),
+        pickle_module=custom_pickle_loader
+    )
+
+    # Clean up the state dictionary keys (e.g., remove 'module.' prefix)
     new_state_dict = {}
     for k, v in state_dict.items():
         name = k[7:] if k.startswith('module.') else k
         new_state_dict[name] = v
 
+    # Load the state into the model
     model.load_state_dict(new_state_dict, strict=False)
     model.eval()
+    print("Model loaded successfully inside inference.py.")
     return model
