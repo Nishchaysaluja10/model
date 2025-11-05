@@ -49,23 +49,23 @@ def load_amr_model() -> GAT_Light:
     # Custom Unpickler to handle the 'persistent_load' instruction
     class CustomUnpickler(pickle.Unpickler):
         def persistent_load(self, saved_id):
-            # This is a placeholder. We don't need to load anything from persistent_id.
             return None
 
-    # A custom class that mimics the `pickle` module
+    # A custom class that mimics the `pickle` module's interface
     class CustomPickleModule:
-        # torch.load expects the module to have an 'Unpickler' attribute
-        Unpickler = CustomUnpickler
         __name__ = "custom_pickle"
+        Unpickler = CustomUnpickler
 
-    # Instantiate our custom pickle loader
-    custom_pickle_loader = CustomPickleModule()
+        @staticmethod
+        def load(f):
+            # The load function that torch.load will call
+            return CustomPickleModule.Unpickler(f).load()
 
-    # Load the state dictionary using the custom pickle module
+    # Load the state dictionary using the custom pickle module class
     state_dict = torch.load(
         MODEL_PATH,
         map_location=torch.device('cpu'),
-        pickle_module=custom_pickle_loader
+        pickle_module=CustomPickleModule  # Pass the class, not an instance
     )
 
     # Clean up the state dictionary keys (e.g., remove 'module.' prefix)
