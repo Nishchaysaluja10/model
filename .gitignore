@@ -1,0 +1,16 @@
+Ignore the common names for virtual environment folders
+
+venv/
+
+
+--- Compiled Python Files ---
+
+Ignore the directory where Python stores bytecode cache
+
+pycache/
+
+Ignore specific bytecode files
+
+*.py[co]
+
+best_gat_realistic.pth/
